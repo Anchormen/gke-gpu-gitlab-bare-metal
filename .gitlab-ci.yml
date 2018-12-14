@@ -1,0 +1,36 @@
+stages:
+    - test
+    - deploy
+# Test in a CPU, only 1 epoch
+test:
+    stage: test
+    image: tensorflow/tensorflow:1.10.0-py3
+    script:
+        - python code-to-run.py 1
+# Deploy in a GPU and run all epochs
+deploy:
+    image: google/cloud-sdk
+    stage: deploy
+    script:
+        # Install kubectl from https://gitlab.com/gitlab-examples/kubernetes-deploy
+        - curl -L -o /usr/bin/kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/latest.txt)/bin/linux/amd64/kubectl && chmod +x /usr/bin/kubectl
+        - kubectl version --client
+        - echo "${KUBE_CA_PEM}" > kube_ca.pem
+        - kubectl config set-cluster default-cluster --server=${KUBE_URL} --certificate-authority="$(pwd)/kube_ca.pem"
+        - kubectl config set-credentials default-admin --token=${KUBE_TOKEN}
+        - kubectl config set-context default-system --cluster=default-cluster --user=default-admin --namespace=${CI_PROJECT_NAME}
+        - kubectl config use-context default-system        
+        - kubectl cluster-info || true
+        # Secrets
+        - kubectl delete secret regsecret --namespace=${CI_PROJECT_NAME} || true
+        - kubectl create secret docker-registry regsecret --docker-server="nvcr.io" --docker-username='$oauthtoken' --docker-password=${DOCKER_REGISTRY_PASSWORD} --docker-email="email@email.com" --namespace=${CI_PROJECT_NAME} || true
+        # Code as configmap
+        - kubectl delete configmap code-to-run --namespace=${CI_PROJECT_NAME} || true
+        - kubectl create configmap code-to-run --from-file=code-to-run.py --namespace=${CI_PROJECT_NAME}
+        # Run the code as a job
+        - kubectl delete -f gke-gpu-gitlab-job.yaml --namespace=${CI_PROJECT_NAME} || true
+        - kubectl create -f gke-gpu-gitlab-job.yaml --namespace=${CI_PROJECT_NAME}
+        # Wait until the code is finished
+        - until kubectl get jobs my-gpu-job --namespace=${CI_PROJECT_NAME} -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' | grep True ; do sleep 5 ; echo "job in progress"; done;
+        # Get results
+        - kubectl logs $(kubectl get pods --selector=job-name=my-gpu-job --output=jsonpath={.items..metadata.name} --namespace=${CI_PROJECT_NAME}) --namespace=${CI_PROJECT_NAME}
